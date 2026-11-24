@@ -595,7 +595,7 @@ impl State {
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         // Bounded like the other counts: a mesh dispatch of too many groups
         // runs until the host's watchdog resets the device.
-        let x = x.min(crate::bounds::MAX_MESH_GROUPS);
+        let x = crate::bounds::mesh_groups(x);
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = self.prepare_for(list, false, true)
@@ -1210,6 +1210,31 @@ const QUAD_STRIP: u32 = 20;
 
 /// Fixed-function state, straight onto the host list.
 pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
+    #[cfg(feature = "diagnostics")]
+    {
+        use std::sync::OnceLock;
+        static SCALE: OnceLock<f32> = OnceLock::new();
+        let scale = *SCALE.get_or_init(|| {
+            std::env::var("VICTORY_VIEWPORT_SCALE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|v: &f32| v.is_finite() && *v > 0.0 && *v <= 1.0)
+                .unwrap_or(1.0)
+        });
+        if scale < 1.0 && !viewports.is_empty() {
+            let scaled: Vec<_> = viewports
+                .iter()
+                .map(|v| D3D12_VIEWPORT {
+                    Width: v.Width * scale,
+                    Height: v.Height * scale,
+                    ..*v
+                })
+                .collect();
+            // SAFETY: an open list.
+            unsafe { list.list.RSSetViewports(&scaled) };
+            return;
+        }
+    }
     // SAFETY: an open list.
     unsafe { list.list.RSSetViewports(viewports) };
 }

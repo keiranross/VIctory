@@ -25,14 +25,16 @@ use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint shift; };
 RWByteAddressBuffer args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
-static const uint BUDGET = 1u << 27;
+// `shift` scales every bound down (diagnostics), to keep a translated
+// shader's per-thread cost inside the host's watchdog budget.
+static const uint BUDGET = 1u << (27 - min(shift, 27u));
 // Groups of one dispatch; more run empty.
-static const uint GROUPS = 1u << 20;
+static const uint GROUPS = 1u << (20 - min(shift, 20u));
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
@@ -41,8 +43,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     uint cost;
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
-        uint count = min(args.Load(at), 1u << 24);
-        uint instances = min(args.Load(at + 4), (1u << 26) / max(count, 1u));
+        uint count = min(args.Load(at), 1u << (24 - min(shift, 24u)));
+        uint instances = min(args.Load(at + 4), (1u << (26 - min(shift, 26u))) / max(count, 1u));
         cost = count * instances;
         args.Store2(at, uint2(count, instances));
     } else if (kind == 2) {
@@ -56,7 +58,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     } else {
         // Mesh dispatches: the console's are one-dimensional.
         uint3 g = args.Load3(at);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+        g = uint3(min(g.x, 1u << (16 - min(shift, 16u))), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128;
         args.Store3(at, g);
     }
@@ -157,7 +159,7 @@ pub(crate) fn bound(
         return false;
     }
     let l = &list.list;
-    let constants = [kind, stride, records, 0];
+    let constants = [kind, stride, records, crate::bounds::work_shift()];
     // SAFETY: an open list; our root signature, pipeline and a live buffer
     // the caller's list holds.
     unsafe {

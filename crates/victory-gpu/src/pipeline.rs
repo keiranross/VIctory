@@ -109,13 +109,26 @@ impl Shader {
             .get_or_init(|| {
                 let done = translate(&self.container);
                 match &done {
-                    Ok(t) => tracing::info!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        user_data = t.host.user_data.len(),
-                        samplers = t.host.samplers.len(),
-                        "shader translated"
-                    ),
+                    Ok(t) => {
+                        tracing::info!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            user_data = t.host.user_data.len(),
+                            samplers = t.host.samplers.len(),
+                            "shader translated"
+                        );
+                        #[cfg(feature = "diagnostics")]
+                        if let Ok(dir) = std::env::var("VICTORY_SHADER_DUMP") {
+                            let _ = std::fs::write(
+                                format!("{dir}/{}.dxil", self.hash),
+                                &t.host.dxil,
+                            );
+                            let _ = std::fs::write(
+                                format!("{dir}/{}.cso", self.hash),
+                                &self.container,
+                            );
+                        }
+                    }
                     Err(e) => tracing::warn!(
                         stage = self.stage,
                         hash = %self.hash,

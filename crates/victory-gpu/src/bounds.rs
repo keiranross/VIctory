@@ -35,18 +35,36 @@ pub(crate) const MAX_GROUPS: u32 = 1 << 16;
 /// inside the host's per-dispatch limit.
 pub(crate) const MAX_DISPATCH_GROUPS: u64 = 1 << 20;
 
-/// The most groups one mesh dispatch may ask for.
-pub(crate) const MAX_MESH_GROUPS: u32 = 1 << 20;
+/// How many powers of two to take off every work bound (diagnostics). A
+/// translated shader can spend hundreds of calls per thread; a title's
+/// original group counts then put more work in one list than the host can
+/// finish before its watchdog resets the device. Running a bounded fraction
+/// of the work keeps the run alive and still draws real geometry.
+pub(crate) fn work_shift() -> u32 {
+    #[cfg(feature = "diagnostics")]
+    {
+        std::env::var("VICTORY_WORK_SHIFT")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(20)
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        0
+    }
+}
+
+fn capped(value: u32) -> u32 {
+    value >> work_shift()
+}
 
 /// The group counts of a dispatch, bounded.
 pub(crate) fn dispatch_groups(x: u32, y: u32, z: u32) -> (u32, u32, u32) {
-    let (x, y, z) = (
-        x.min(MAX_GROUPS),
-        y.min(MAX_GROUPS),
-        z.min(MAX_GROUPS),
-    );
+    let cap = capped(MAX_GROUPS);
+    let (x, y, z) = (x.min(cap), y.min(cap), z.min(cap));
     // The product of the counts is the work; keep it inside the limit.
-    if u64::from(x) * u64::from(y) * u64::from(z) > MAX_DISPATCH_GROUPS {
+    if u64::from(x) * u64::from(y) * u64::from(z) > u64::from(capped(MAX_DISPATCH_GROUPS as u32)) {
         return (0, 0, 0);
     }
     (x, y, z)
@@ -54,10 +72,15 @@ pub(crate) fn dispatch_groups(x: u32, y: u32, z: u32) -> (u32, u32, u32) {
 
 /// The vertex and instance counts of a draw, bounded.
 pub(crate) fn draw_counts(vertices: u32, instances: u32) -> (u32, u32) {
-    let vertices = vertices.min(MAX_VERTICES);
+    let vertices = vertices.min(capped(MAX_VERTICES));
     // The vertices of every instance run, so the product is the work.
-    let instances = instances.min(MAX_INSTANCES / vertices.max(1));
+    let instances = instances.min(capped(MAX_INSTANCES) / vertices.max(1));
     (vertices, instances)
+}
+
+/// The most groups one mesh dispatch may ask for, bounded.
+pub(crate) fn mesh_groups(x: u32) -> u32 {
+    x.min(capped(MAX_GROUPS))
 }
 
 #[cfg(test)]
