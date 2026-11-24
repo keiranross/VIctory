@@ -518,6 +518,10 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        // The title's counts are bounded: a count read from a buffer a
+        // dropped pass left behind can be enormous, and the host runs it
+        // until its watchdog resets the device.
+        let (x, y, z) = crate::bounds::dispatch_groups(x, y, z);
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -589,6 +593,9 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        // Bounded like the other counts: a mesh dispatch of too many groups
+        // runs until the host's watchdog resets the device.
+        let x = x.min(crate::bounds::MAX_MESH_GROUPS);
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = self.prepare_for(list, false, true)
@@ -853,6 +860,9 @@ impl State {
             } else {
                 (vertices, first)
             };
+            // Bounded: the title's counts can be a value no legitimate
+            // command has (see `crate::bounds`).
+            let (count, instances) = crate::bounds::draw_counts(count, instances);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
             // SAFETY: an open list with everything set.
@@ -940,6 +950,9 @@ impl State {
         }
         let ran = self.topology != RECTANGLES && self.prepare(list, true);
         if ran {
+            // Bounded: the title's counts can be a value no legitimate
+            // command has (see `crate::bounds`).
+            let (indices, instances) = crate::bounds::draw_counts(indices, instances);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
             // SAFETY: an open list with everything set.
