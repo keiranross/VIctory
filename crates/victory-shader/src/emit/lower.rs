@@ -50,7 +50,10 @@ pub(crate) struct Parts<'a> {
     pub prims: Vec<SigElement>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
-}
+    /// The host's wave lane count: a compute shader that depends on the
+    /// lane layout declares the console's wave size, which the host device
+    /// must support (a wave64 console shader needs a 64-lane host wave).
+    pub host_lanes: u32,}
 
 enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
@@ -183,6 +186,10 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
+    /// Whether the host's wave is the console's wave: the console's lane
+    /// layout can be the host's only then. When it is not, the code that
+    /// depends on the lane layout is refused rather than computed wrongly.
+    console_lanes_supported: bool,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
@@ -354,6 +361,7 @@ impl<'a> Lower<'a> {
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let mut console_lanes = false;
+        let mut console_lanes_supported = true;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -394,8 +402,28 @@ impl<'a> Lower<'a> {
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
+            // The console's lane layout is only the host's when the host's
+            // wave is the console's wave: the thread relabelling, the
+            // ballots and the lane masks all assume host lane n is console
+            // lane n. A host with a smaller wave refuses a shader that
+            // declares the console's wave size outright ("Shader wants wave
+            // lane count of 64 but maximum wave lane count for device is
+            // 32"), so the wave size is declared only when the host can run
+            // it.
+            let host_wave = wave.min(x.host_lanes);
+            console_lanes_supported = host_wave >= wave;
             if console_lanes || one_wave && s.lds_dwords > 0 {
-                s.wave_size = Some(wave);
+                if console_lanes_supported {
+                    s.wave_size = Some(wave);
+                } else {
+                    // The host cannot run the console's wave. A shader that
+                    // does not read the lane layout still runs: its threads
+                    // are the host's, and the wave operations it uses (a
+                    // reduction over its active lanes) give the same answer
+                    // on any wave size. A shader that does read the lane
+                    // layout is refused when it reaches that code.
+                    s.wave_size = None;
+                }
             }
         }
         let mut no_barrier = HashSet::new();
@@ -480,6 +508,7 @@ impl<'a> Lower<'a> {
             writes_uavs,
             src0: None,
             console_lanes,
+            console_lanes_supported,
             flat: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
@@ -1862,6 +1891,12 @@ impl<'a> Lower<'a> {
         if self.s.threads.is_none() && !(quad && self.s.pixel) {
             return Err("a cross-lane operation outside compute");
         }
+        // The host's wave is smaller than the console's: the lanes are the
+        // host's, not the console's, so the code that reads the console's
+        // lane layout cannot be computed as the console computed it.
+        if !self.console_lanes_supported && self.console_lanes {
+            return Err("a cross-lane operation on a host with a smaller wave");
+        }
         debug_assert!(self.s.threads.is_none() || self.console_lanes);
         self.s.flags |= flags::WAVE_OPS;
         Ok(())
@@ -1895,7 +1930,10 @@ impl<'a> Lower<'a> {
             118,
             &[flat],
         );
-        let wave = self.s.wave_size.expect("set with console lanes");
+        // The console's wave, declared or not: the relabelling is console
+        // arithmetic even when the host runs a smaller wave (the code reads
+        // no other lane then; its own lane is the host's).
+        let wave = self.wave();
         let mask = self.s.m.i32(!(wave - 1));
         let base = self.s.m.bin(e, Bin::And, first, mask);
         let lane = self.lane_index();
@@ -6816,6 +6854,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            host_lanes: 64,
         })
         .map(|_| ())
     }
@@ -6910,6 +6949,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            host_lanes: 64,
         }).unwrap();
 
         let container =

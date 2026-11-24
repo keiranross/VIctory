@@ -449,6 +449,33 @@ impl Host {
         })
     }
 
+    /// The largest wave the host runs, in lanes: a console compute shader
+    /// that depends on its wave's lane layout can only declare the
+    /// console's wave when the host supports it. Logged once.
+    pub(crate) fn wave_lanes(&self) -> u32 {
+        static LANES: OnceLock<u32> = OnceLock::new();
+        *LANES.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            // SAFETY: the query writes its own structure of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS1,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let lanes = if ok { options.WaveLaneCountMax } else { 0 };
+            tracing::info!(
+                lanes,
+                min = options.WaveLaneCountMin,
+                "host wave lane count"
+            );
+            lanes
+        })
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
@@ -1320,22 +1347,41 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
-    // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
-    for_pieces(src as usize, len, 64 << 10, |at, n| {
-        let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
-                }
-            });
+    // Something is unmapped: copy up to the faulting page, zero that page,
+    // and carry on past it. A range is often readable apart from a few
+    // pages the title has not committed (or has unmapped since), and the
+    // kernel reports how far it read, so one fault costs one page, not a
+    // walk of the range in 64 KiB pieces.
+    let mut at = 0;
+    while at < len {
+        let mut done = 0;
+        // SAFETY: `[at, len)` of the destination is mapped; the kernel
+        // checks the source.
+        let failed = unsafe {
+            windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
+                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                src.add(at).cast(),
+                dst.add(at).cast(),
+                len - at,
+                &mut done,
+            )
+        } == 0;
+        if !failed {
+            break;
         }
-    });
+        at += (done as usize).min(len - at);
+        if at >= len {
+            break;
+        }
+        // The page the read stopped on: zeros, then past it.
+        let page = (4 << 10) - (src as usize + at) % (4 << 10);
+        let n = page.min(len - at);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+        // SAFETY: inside the destination, which is mapped.
+        unsafe { dst.add(at).write_bytes(0, n) };
+        at += n;
+    }
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not

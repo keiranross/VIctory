@@ -186,6 +186,26 @@ pub struct UserData {
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_with_wave(container, HOST_WAVE_LANES)
+}
+
+/// The host's wave lane count, when it is not known: the console's, so a
+/// translation made without one is the console's own.
+pub const HOST_WAVE_LANES: u32 = 64;
+
+/// Translates a console shader container for a host whose wave has
+/// `host_lanes` lanes.
+///
+/// A console compute shader that depends on the lane layout declares the
+/// console's wave size (`WaveSize`), so the host device must support it:
+/// a wave64 console shader needs a host that runs 64-lane waves, and a
+/// host with fewer lanes refuses the shader outright (the device reports
+/// "Shader wants wave lane count of 64 but maximum wave lane count for
+/// device is 32"). Where the host's wave is smaller, the console's wave
+/// is simulated on the host's lanes instead: the translator keeps the
+/// console's lane numbering and computes the console's results itself,
+/// rather than letting the host's wave operations do it.
+pub fn translate_with_wave(container: &[u8], host_lanes: u32) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -206,8 +226,9 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage)?;
     let io = io::raise(&p, &native)?;
     let st = structure::structure(&p)?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit_with_wave(&c, &native, &p, &st, &io, &res, host_lanes)
 }
+
 
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
@@ -217,6 +238,19 @@ pub fn emit(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    emit_with_wave(c, native, p, st, io, res, HOST_WAVE_LANES)
+}
+
+/// Emits a program for a host whose wave has `host_lanes` lanes.
+pub fn emit_with_wave(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    host_lanes: u32,
 ) -> Result<HostShader, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -283,6 +317,7 @@ pub fn emit(
         outputs,
         prims,
         mesh_stride,
+        host_lanes,
     })?;
     Ok(HostShader {
         stage: native.stage,

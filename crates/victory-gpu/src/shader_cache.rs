@@ -70,11 +70,24 @@ fn build() -> &'static [u8; 32] {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    // The host's wave lane count changes the translation (whether the
+    // console's wave size is declared), so it is part of the cache key.
+    let lanes = crate::host::host().map_or(victory_shader::emit::HOST_WAVE_LANES, |h| h.wave_lanes());
+    let key = key(lanes);
+    let translate = |c: &[u8]| {
+        victory_shader::emit::translate_with_wave(c, lanes).map_err(|e| e.to_string())
+    };
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(cache, &key, container, translate),
         None => translate(container),
     }
+}
+
+/// The build fingerprint with the host's wave lane count.
+fn key(lanes: u32) -> [u8; 32] {
+    let mut bytes = build().to_vec();
+    bytes.extend_from_slice(&lanes.to_le_bytes());
+    *blake3::hash(&bytes).as_bytes()
 }
 
 /// The cache entry's converter: the build and the container in, the
